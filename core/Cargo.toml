@@ -10,4 +10,5 @@ eyre = "0.6.8"
 serde = { version = "1.0.162", features = ["derive"] }
 
 [dev-dependencies]
+maplit = "1.0.2"
 rand = "0.8.5"

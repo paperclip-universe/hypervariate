@@ -1,5 +1,7 @@
-use hypervariate_core::game::GameMatch;
+use hypervariate_core::game::{GameMatch, GameVariables};
+use maplit::hashmap;
 use rand::Rng;
+use std::collections::HashMap;
 
 struct RangeGuessingGame {
     range_upper: u32,
@@ -11,6 +13,13 @@ impl RangeGuessingGame {
         Self {
             range_upper,
             attempts,
+        }
+    }
+
+    pub fn get_variables(&self) -> HashMap<String, f64> {
+        hashmap! {
+            "attempts".to_owned() => self.attempts as f64,
+            "range_upper".to_owned() => self.range_upper as f64,
         }
     }
 
@@ -28,7 +37,9 @@ impl RangeGuessingGame {
                 std::cmp::Ordering::Equal => {
                     return GameMatch {
                         winner: 0,
-                        variables: Default::default(),
+                        variables: GameVariables {
+                            variables: self.get_variables(),
+                        },
                         time: 0,
                     }
                 }
@@ -37,7 +48,9 @@ impl RangeGuessingGame {
 
         GameMatch {
             winner: 1,
-            variables: Default::default(),
+            variables: GameVariables {
+                variables: self.get_variables(),
+            },
             time: 0,
         }
     }
@@ -45,8 +58,7 @@ impl RangeGuessingGame {
 
 mod tests {
     use crate::RangeGuessingGame;
-    use hypervariate_core::*;
-    use std::sync::{Arc, Mutex};
+    use hypervariate_core::{game::GameMatches, *};
 
     #[test]
     fn test_guessing_game() {
@@ -58,11 +70,38 @@ mod tests {
     #[test]
     fn test_state() {
         let state = State {
-            variables: Arc::new(Mutex::new(game::GameVariables::default())),
+            variables: game::GameVariables::default(),
+            matches: game::GameMatches::default(),
         };
-        assert_eq!(state.variables.lock().unwrap().variables.len(), 0);
+        assert_eq!(state.variables.variables.len(), 0);
     }
 
     #[test]
-    fn test_balance() {}
+    fn test_balance() {
+        let mut game = RangeGuessingGame::new(100, 10);
+        let mut game2 = RangeGuessingGame::new(10000, 7);
+        let mut matches = GameMatches::new(
+            2,
+            game::GameVariables {
+                variables: game.get_variables(),
+            },
+        );
+
+        let mut results = vec![];
+
+        for _ in 0..=100 {
+            results.push(game.simulate());
+            results.push(game2.simulate());
+        }
+
+        matches.report_results(results);
+        let balanced = matches.balance().unwrap();
+        println!("{:?}", balanced);
+        assert_ne!(
+            game::GameVariables {
+                variables: game.get_variables(),
+            },
+            balanced
+        );
+    }
 }

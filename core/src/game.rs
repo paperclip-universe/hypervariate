@@ -1,42 +1,69 @@
+use crate::math::calculate_correlation_coefficient;
+use eyre::{eyre, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use eyre::Result;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct GameVariables {
     pub variables: HashMap<String, f64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct GameMatch {
     pub time: u64, // TODO: Is there a dedicated timestamp type?
     pub winner: u64,
     pub variables: GameVariables,
 }
 
-fn get_result_distribution_from_vec(vec: Vec<GameMatch>) -> HashMap<u64, i32> {
+// TODO: cleanup cleanup everybody everywhere
+fn get_result_distribution_from_vec(vec: Vec<GameMatch>) -> HashMap<u64, f64> {
     let mut distributions = HashMap::new();
+    let mut total = 0;
 
     for value in vec {
         let count = distributions.entry(value.winner).or_insert(0);
         *count += 1;
+        total += 1;
     }
 
     distributions
+        .iter()
+        .map(|(x, y)| (*x, *y as f64 / total as f64))
+        .collect()
 }
 
 // TODO: Move to database (just a small todo)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Default, Serialize)]
 pub struct GameMatches {
     pub games_played: u64,
     pub results: Vec<GameMatch>,
     pub num_teams: u32,
+    pub base_variables: GameVariables,
 }
 
+/// (value, is_winner)
+type SingleVariableTeamResult = (u64, bool);
+
 impl GameMatches {
+    pub fn new(num_teams: u32, base_variables: GameVariables) -> Self {
+        Self {
+            games_played: 0,
+            results: vec![],
+            num_teams,
+            base_variables,
+        }
+    }
+
     pub fn report_result(mut self, result: GameMatch) {
         self.games_played += 1;
         self.results.push(result);
+    }
+
+    pub fn report_results(&mut self, results: Vec<GameMatch>) {
+        for result in results {
+            self.games_played += 1;
+            self.results.push(result);
+        }
     }
 
     pub fn get_results_after_timestamp(self, timestamp: u64) -> Vec<GameMatch> {
@@ -46,99 +73,130 @@ impl GameMatches {
             .collect()
     }
 
-    pub fn get_result_distribution(self) -> HashMap<u64, i32> {
+    pub fn get_result_distribution(self) -> HashMap<u64, f64> {
         get_result_distribution_from_vec(self.results)
     }
 
-    pub fn get_result_distribution_after_timestamp(self, timestamp: u64) -> HashMap<u64, i32> {
+    pub fn get_result_distribution_after_timestamp(self, timestamp: u64) -> HashMap<u64, f64> {
         get_result_distribution_from_vec(self.get_results_after_timestamp(timestamp))
     }
 
-    // (value, is_winner)
-    type SingleVariableTeamResult = (u64, bool);
-
-    // Calculates the correlation between a variable and a team winning/losing.
-    // This returns the correlation coefficient, which is a value between -1 and 1.
-    pub fn calculate_variable_correlation_single(self, variable: String, team: u32) -> Result<f64> {
-        let mut correlations = HashMap::new();
-
+    /// Calculates the correlation between a variable and a team winning/losing.
+    /// This returns the correlation coefficient, which is a value between -1 and 1.
+    pub fn calculate_variable_correlation_single_team(
+        &self,
+        variable: String,
+        team: u32,
+    ) -> Result<f64> {
         // For each team, we want to see if the variable correlates with a team winning or losing
-        for team in 0..=self.num_teams {
-            let mut single_correlation: Vec<SingleVariableTeamResult> = Vec::new();
+        let mut single_correlation: Vec<SingleVariableTeamResult> = Vec::new();
 
-            for result in &self.results {
-                let winning_team = result.winner;
-                let variable = result.variables.variables.get(&variable);
+        for result in &self.results {
+            let winning_team = result.winner;
+            let variable = result.variables.variables.get(&variable);
 
-                if let Some(variable) = variable {
-                    single_correlation.push((
-                        *variable as u64,
-                        winning_team == team,
-                    ));
-                }
+            if let Some(variable) = variable {
+                single_correlation.push((*variable as u64, winning_team == team.into()));
             }
-
-            // If all results have the same value, we can't calculate a correlation
-            let first = single_correlation[0];
-            if single_correlation.iter().all(|x| x.0 == first.0) {
-                return Err(eyre!("All results have the same value for this variable"));
-            }
-
-            // Calculate the correlation coefficient
-            
         }
+
+        // If all results have the same value, we can't calculate a correlation
+        let first = single_correlation[0];
+        if single_correlation.iter().all(|x| x.0 == first.0) {
+            return Err(eyre!("All results have the same value for this variable"));
+        }
+
+        // Calculate the correlation coefficient
+        let coefficient = calculate_correlation_coefficient(
+            single_correlation
+                .iter()
+                .map(|corr| (corr.0, corr.1 as u64))
+                .collect(),
+        );
+
+        return Ok(coefficient);
+    }
+
+    pub fn calculate_variable_correlation_single_variable(
+        &self,
+        variable: String,
+    ) -> Result<HashMap<u32, f64>> {
+        let mut correlations: HashMap<u32, f64> = HashMap::new();
+
+        for team in 0..self.num_teams {
+            correlations.insert(
+                team,
+                // TODO: fix memory management
+                self.calculate_variable_correlation_single_team(variable.clone(), team)?,
+            );
+        }
+
+        Ok(correlations)
+    }
+
+    pub fn calculate_variable_correlation(self) -> Result<HashMap<String, HashMap<u32, f64>>> {
+        let mut correlations: HashMap<String, HashMap<u32, f64>> = HashMap::new();
+
+        for variable in &self.base_variables.variables {
+            correlations.insert(
+                variable.0.to_string(),
+                self.calculate_variable_correlation_single_variable(variable.0.to_string())?,
+            );
+        }
+
+        Ok(correlations)
+    }
 
     // TODO: better variable balancing
     /// Balances the variables based on the results of the matches to make the game fairer
     /// It does this by attempting to correlate whether a variable is higher or lower with a team winning or losing
     /// It then adjusts the variable to make it more likely for the losing team to win
-    pub fn balance(&mut self, starting_variables: GameVariables) -> GameVariables {
-        let mut adjusted_variables = starting_variables.clone();
+    pub fn balance(self) -> Result<GameVariables> {
+        let mut balanced_variables = self.base_variables.clone();
+        // TODO: Fix clone() - I hate memory management :P
+        let distribution: HashMap<u64, f64> = self.clone().get_result_distribution();
+        let correlations: HashMap<String, HashMap<u32, f64>> =
+            self.calculate_variable_correlation()?;
 
-        // For each variable, we want to see if it correlates with a team winning or losing
-        for (variable_name, variable_value) in starting_variables.variables {
-            let mut total_winners = 0.0;
-            let mut total_losers = 0.0;
+        // What should the result distribution be?
+        let optimal_distribution: f64 = 1.0 / (distribution.len() as f64);
 
-            // For each match, we want to see if this variable correlates with a team winning or losing
-            for result in &self.results {
-                let winning_team = result.winner;
-                let variable = result.variables.variables.get(&variable_name);
+        // How far off is it?
+        let distribution_difference: Vec<(u64, f64)> = distribution
+            .iter()
+            .map(|(team, amount)| (*team, optimal_distribution - *amount))
+            .collect();
 
-                // If the variable doesn't exist in the match, we can't use it to balance
-                if variable.is_none() {
-                    continue;
-                }
+        let mut adjustments: HashMap<String, f64> = HashMap::new();
 
-                // If the variable is higher than the average, it is more likely to win
-                if variable.unwrap() > &variable_value {
-                    if winning_team == 0 {
-                        total_winners += 1.0;
-                    } else {
-                        total_losers += 1.0;
-                    }
-                } else if winning_team == 0 {
-                    total_losers += 1.0;
-                } else {
-                    total_winners += 1.0;
-                }
+        // Adjust variables based on correlation and distribution difference
+        for (variable, correlation_map) in &correlations {
+            let mut total_adjustment: f64 = 0.0;
 
-                // TODO: Figure out how to adjust variable
-                // If the variable is more likely to win and the winners are greater than the losers, we should lower the variable by a number proportional to the difference
-                if total_winners > total_losers {
-                    adjusted_variables.variables.insert(
-                        variable_name.clone(),
-                        variable_value * (total_losers / total_winners) / 4f64,
-                    );
-                } else {
-                    adjusted_variables.variables.insert(
-                        variable_name.clone(),
-                        variable_value * (total_winners / total_losers) / 4f64,
-                    );
-                }
+            for (team, correlation) in correlation_map {
+                let (team_index, _) = distribution_difference
+                    .iter()
+                    .find(|(index, _)| *index == *team as u64)
+                    .ok_or(eyre!("Invalid index for distribution_difference"))?;
+
+                let (_, difference) = distribution_difference
+                    .get(*team_index as usize)
+                    .ok_or(eyre!("Invalid index for distribution_difference"))?;
+
+                let team_adjustment = difference * correlation;
+                total_adjustment += team_adjustment;
+            }
+
+            adjustments.insert(variable.clone(), total_adjustment);
+        }
+
+        // Apply adjustments to the variables
+        for (variable, adjustment) in &adjustments {
+            if let Some(value) = balanced_variables.variables.get_mut(variable) {
+                *value += *adjustment;
             }
         }
 
-        adjusted_variables
+        Ok(balanced_variables)
     }
 }
